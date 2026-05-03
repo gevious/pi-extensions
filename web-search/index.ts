@@ -1,26 +1,36 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Type, type Static } from "typebox";
 
-const WebSearchParamsSchema = Type.Object({
-  query: Type.String({ description: "Search query" }),
-  count: Type.Optional(
-    Type.Integer({ minimum: 1, maximum: 20, description: "Max results (1-20), default 5" }),
-  ),
-  topic: Type.Optional(
-    Type.String({
+const WebSearchParamsSchema = {
+  type: "object",
+  properties: {
+    query: { type: "string", description: "Search query" },
+    count: {
+      type: "integer",
+      minimum: 1,
+      maximum: 20,
+      description: "Max results (1-20), default 5",
+    },
+    topic: {
+      type: "string",
       description: "Tavily topic",
       enum: ["general", "news"],
-    }),
-  ),
-  timeRange: Type.Optional(
-    Type.String({
+    },
+    timeRange: {
+      type: "string",
       description: "Optional time range filter",
       enum: ["day", "week", "month", "year"],
-    }),
-  ),
-});
+    },
+  },
+  required: ["query"],
+  additionalProperties: false,
+} as const;
 
-type WebSearchParams = Static<typeof WebSearchParamsSchema>;
+type WebSearchParams = {
+  query: string;
+  count?: number;
+  topic?: "general" | "news";
+  timeRange?: "day" | "week" | "month" | "year";
+};
 
 type TavilyResult = {
   title?: string;
