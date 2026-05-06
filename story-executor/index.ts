@@ -3,7 +3,6 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 type StoryStatus = "pending" | "running" | "done" | "failed";
-
 type ResultStatus = "done" | "failed";
 
 type JsonPlanFile = {
@@ -48,24 +47,37 @@ type Plan = {
     stories: Story[];
 };
 
+type CheckpointStory = {
+    status: StoryStatus;
+    startedAt?: string;
+    finishedAt?: string;
+    error?: string;
+    summary?: string;
+};
+
 type Checkpoint = {
     planFile: string;
     updatedAt: string;
-    stories: Record<
-        string,
-        {
-            status: StoryStatus;
-            startedAt?: string;
-            finishedAt?: string;
-            error?: string;
-            summary?: string;
-        }
-    >;
+    stories: Record<string, CheckpointStory>;
 };
 
 type StoryResult = {
     status: ResultStatus;
     summary?: string;
+};
+
+type ParsedArgs = {
+    file?: string;
+    reset: boolean;
+};
+
+type RunState = {
+    planFile: string;
+    cwd: string;
+    checkpointPath: string;
+    resultsDir: string;
+    completed: string[];
+    failed: string[];
 };
 
 const STATE_DIR = ".story-executor";
@@ -88,13 +100,13 @@ export default function storyExecutor(pi: ExtensionAPI) {
 
             await mkdir(resultsDir, { recursive: true });
 
-            const plan = await readPlan(path.resolve(cwd, planFile));
-            validatePlan(plan);
-
             if (options.reset) {
                 await rm(resultsDir, { recursive: true, force: true });
                 await mkdir(resultsDir, { recursive: true });
             }
+
+            const plan = await readPlan(path.resolve(cwd, planFile));
+            validatePlan(plan);
 
             const checkpoint = options.reset
                 ? freshCheckpoint(planFile, plan, true)
@@ -102,119 +114,38 @@ export default function storyExecutor(pi: ExtensionAPI) {
 
             await writeCheckpoint(checkpointPath, checkpoint);
 
-            const completed: string[] = [];
-            const failed: string[] = [];
-
-            while (true) {
-                const story = getNextRunnableStory(plan, checkpoint);
-                if (!story) break;
-
-                checkpoint.stories[story.id] = {
-                    ...checkpoint.stories[story.id],
-                    status: "running",
-                    startedAt: now(),
-                    finishedAt: undefined,
-                    error: undefined,
-                    summary: undefined,
-                };
-                checkpoint.updatedAt = now();
-                await writeCheckpoint(checkpointPath, checkpoint);
-
-                const resultFile = path.resolve(resultsDir, `${safeFileName(story.id)}.json`);
-                const parentSession = ctx.sessionManager.getSessionFile();
-                const kickoff = buildStoryPrompt({
-                    story,
-                    plan,
-                    resultFile: path.relative(cwd, resultFile),
-                    checkpointFile: path.relative(cwd, checkpointPath),
-                });
-
-                try {
-                    const result = await ctx.newSession({
-                        parentSession,
-                        setup: async (sm) => {
-                            sm.appendMessage({
-                                role: "user",
-                                timestamp: Date.now(),
-                                content: [
-                                    {
-                                        type: "text",
-                                        text: [
-                                            "Story executor fresh session.",
-                                            "Previous story context is intentionally unavailable.",
-                                            `Required skill: ${story.skill}`,
-                                            `Story ID: ${story.id}`,
-                                        ].join("\n"),
-                                    },
-                                ],
-                            });
-                        },
-                        withSession: async (freshCtx) => {
-                            await freshCtx.sendUserMessage(kickoff);
-                        },
-                    });
-
-                    if (result.cancelled) {
-                        markFailed(checkpoint, story.id, "Fresh session was cancelled.");
-                        failed.push(story.id);
-                        await writeCheckpoint(checkpointPath, checkpoint);
-                        break;
-                    }
-
-                    const storyResult = await readStoryResult(resultFile);
-
-                    if (storyResult.status !== "done") {
-                        markFailed(
-                            checkpoint,
-                            story.id,
-                            storyResult.summary || "Story result file reported failed.",
-                        );
-                        failed.push(story.id);
-                        await writeCheckpoint(checkpointPath, checkpoint);
-                        break;
-                    }
-
-                    checkpoint.stories[story.id] = {
-                        ...checkpoint.stories[story.id],
-                        status: "done",
-                        finishedAt: now(),
-                        error: undefined,
-                        summary: storyResult.summary,
-                    };
-                    checkpoint.updatedAt = now();
-
-                    await writeCheckpoint(checkpointPath, checkpoint);
-                    completed.push(story.id);
-                } catch (error) {
-                    markFailed(
-                        checkpoint,
-                        story.id,
-                        error instanceof Error ? error.message : String(error),
-                    );
-                    failed.push(story.id);
-                    await writeCheckpoint(checkpointPath, checkpoint);
-                    break;
-                }
-            }
+            const state: RunState = {
+                planFile,
+                cwd,
+                checkpointPath,
+                resultsDir,
+                completed: [],
+                failed: [],
+            };
 
             ctx.ui.notify(
-                [
-                    `story-run-all complete`,
-                    `completed=${completed.length}${completed.length ? ` [${completed.join(", ")}]` : ""}`,
-                    failed.length ? `failed=${failed.join(", ")}` : "",
-                    summarize(plan, checkpoint),
-                ]
-                    .filter(Boolean)
-                    .join("\n"),
-                failed.length ? "error" : "success",
+                `Starting story-run-all for ${plan.stories.length} stories. State: ${path.relative(
+                    cwd,
+                    checkpointPath,
+                )}`,
+                "info",
             );
+
+            await runLoopInFreshSessions({
+                ctx,
+                plan,
+                checkpoint,
+                state,
+            });
         },
     });
 
     pi.registerCommand("story-status", {
         description: "Show story execution status",
         handler: async (args, ctx) => {
-            const planFile = args?.trim() || "issues.json";
+            const options = parseArgs(args || "");
+            const planFile = options.file || "issues.json";
+
             const plan = await readPlan(path.resolve(ctx.cwd, planFile));
             validatePlan(plan);
 
@@ -240,6 +171,111 @@ export default function storyExecutor(pi: ExtensionAPI) {
             const stateDir = path.resolve(ctx.cwd, STATE_DIR);
             await rm(stateDir, { recursive: true, force: true });
             ctx.ui.notify("Story executor state reset.", "success");
+        },
+    });
+}
+
+async function runLoopInFreshSessions(input: {
+    ctx: any;
+    plan: Plan;
+    checkpoint: Checkpoint;
+    state: RunState;
+}): Promise<void> {
+    const { ctx, plan, checkpoint, state } = input;
+
+    const story = getNextRunnableStory(plan, checkpoint);
+
+    if (!story) {
+        await writeRunSummary(state, plan, checkpoint);
+        return;
+    }
+
+    checkpoint.stories[story.id] = {
+        ...checkpoint.stories[story.id],
+        status: "running",
+        startedAt: now(),
+        finishedAt: undefined,
+        error: undefined,
+        summary: undefined,
+    };
+    checkpoint.updatedAt = now();
+    await writeCheckpoint(state.checkpointPath, checkpoint);
+
+    const resultFile = path.resolve(state.resultsDir, `${safeFileName(story.id)}.json`);
+    const parentSession = ctx.sessionManager.getSessionFile();
+
+    const kickoff = buildStoryPrompt({
+        story,
+        plan,
+        resultFile: path.relative(state.cwd, resultFile),
+        checkpointFile: path.relative(state.cwd, state.checkpointPath),
+    });
+
+    await ctx.newSession({
+        parentSession,
+        setup: async (sm: any) => {
+            sm.appendMessage({
+                role: "user",
+                timestamp: Date.now(),
+                content: [
+                    {
+                        type: "text",
+                        text: [
+                            "Story executor fresh session.",
+                            "Previous story context is intentionally unavailable.",
+                            `Required skill: ${story.skill}`,
+                            `Story ID: ${story.id}`,
+                        ].join("\n"),
+                    },
+                ],
+            });
+        },
+        withSession: async (freshCtx: any) => {
+            try {
+                await freshCtx.sendUserMessage(kickoff);
+
+                const storyResult = await readStoryResult(resultFile);
+
+                if (storyResult.status !== "done") {
+                    markFailed(
+                        checkpoint,
+                        story.id,
+                        storyResult.summary || "Story result file reported failed.",
+                    );
+                    state.failed.push(story.id);
+                    await writeCheckpoint(state.checkpointPath, checkpoint);
+                    await writeRunSummary(state, plan, checkpoint);
+                    return;
+                }
+
+                checkpoint.stories[story.id] = {
+                    ...checkpoint.stories[story.id],
+                    status: "done",
+                    finishedAt: now(),
+                    error: undefined,
+                    summary: storyResult.summary,
+                };
+                checkpoint.updatedAt = now();
+
+                state.completed.push(story.id);
+                await writeCheckpoint(state.checkpointPath, checkpoint);
+
+                await runLoopInFreshSessions({
+                    ctx: freshCtx,
+                    plan,
+                    checkpoint,
+                    state,
+                });
+            } catch (error) {
+                markFailed(
+                    checkpoint,
+                    story.id,
+                    error instanceof Error ? error.message : String(error),
+                );
+                state.failed.push(story.id);
+                await writeCheckpoint(state.checkpointPath, checkpoint);
+                await writeRunSummary(state, plan, checkpoint);
+            }
         },
     });
 }
@@ -378,6 +414,25 @@ async function writeCheckpoint(file: string, checkpoint: Checkpoint) {
     await writeFile(file, `${JSON.stringify(checkpoint, null, 2)}\n`, "utf8");
 }
 
+async function writeRunSummary(
+    state: RunState,
+    plan: Plan,
+    checkpoint: Checkpoint,
+): Promise<void> {
+    const summary = {
+        updatedAt: now(),
+        completed: state.completed,
+        failed: state.failed,
+        summary: summarize(plan, checkpoint),
+    };
+
+    await writeFile(
+        path.resolve(path.dirname(state.checkpointPath), "summary.json"),
+        `${JSON.stringify(summary, null, 2)}\n`,
+        "utf8",
+    );
+}
+
 function validatePlan(plan: Plan) {
     const ids = new Set<string>();
 
@@ -514,7 +569,7 @@ function summarize(plan: Plan, checkpoint: Checkpoint): string {
     return `done=${counts.done}, pending=${counts.pending}, running=${counts.running}, failed=${counts.failed}`;
 }
 
-function parseArgs(raw: string): { file?: string; reset: boolean } {
+function parseArgs(raw: string): ParsedArgs {
     const parts = raw.trim().split(/\s+/).filter(Boolean);
 
     return {
